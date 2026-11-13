@@ -255,10 +255,13 @@ function Site.parseChapterLinks(html, novel_path)
 end
 
 --- Parses the <option value="url">title</option> list of the chapter API.
-function Site.parseChapterOptions(html)
+function Site.parseChapterOptions(html, novel_path)
     local list, seen = {}, {}
     for attrs, inner in html:gmatch("<option([^>]*)>(.-)</option>") do
         local value = H.attr(attrs, "value")
+        if value and novel_path and not value:find("^%a[%w+.-]*:") and not value:find("^[/\\#]") then
+            value = novelKey(novel_path) .. "/" .. value -- relative address
+        end
         local path = value and Site.path(value)
         local title = H.text(inner)
         if path and path ~= "/" and title ~= "" and not seen[path] then
@@ -354,10 +357,78 @@ end
 -- JSON-escaped).
 function Site.parseChapterApi(body, novel_path)
     body = H.unescapeJs(body)
-    local list = Site.parseChapterOptions(body)
+    local list = Site.parseChapterOptions(body, novel_path)
     local links = Site.parseChapterLinks(body, novel_path)
     if #links > #list then list = links end
     return list
+end
+
+local function urlKey(url)
+    return novelKey(Site.path(url) or url or "")
+end
+
+--- Checks a chapter list from the API against the chapters linked on the
+-- novel page (whose addresses are known to be right).
+-- Returns the list (with addresses corrected when needed), or nil when it
+-- cannot be trusted.
+function Site.reconcileChapters(list, known, novel_path)
+    if #known == 0 or #list == 0 then return list end
+    local known_keys, known_by_title = {}, {}
+    for _, ch in ipairs(known) do
+        known_keys[urlKey(ch.url)] = ch
+        known_by_title[ch.title] = ch
+    end
+    local function overlap(get)
+        local n = 0
+        for _, ch in ipairs(list) do
+            if known_keys[urlKey(get(ch))] then n = n + 1 end
+        end
+        return n
+    end
+    local need = math.max(1, math.floor(math.min(#known, #list) / 2))
+
+    -- 1. addresses as given
+    if overlap(function(ch) return ch.url end) >= need then return list end
+
+    -- 2. same last part ("chapter-12"), placed under the novel's own address
+    local base = novelKey(novel_path) .. "/"
+    local function rebuilt(ch)
+        local seg = urlKey(ch.url):match("([^/]+)$")
+        return seg and Site.absolute(base .. seg) or ch.url
+    end
+    if overlap(rebuilt) >= need then
+        for _, ch in ipairs(list) do
+            ch.alt_url = ch.url
+            ch.url = rebuilt(ch)
+        end
+        return list
+    end
+
+    -- 3. same titles in the same order: take known addresses, and extend the
+    --    numbering scheme of the known ones to the rest when there is one
+    local same = 0
+    for i = 1, math.min(#known, #list) do
+        if known[i].title == list[i].title then same = same + 1 end
+    end
+    if same >= need then
+        local prefix, offset
+        for i, ch in ipairs(known) do
+            local pre, n = urlKey(ch.url):match("^(.-chapter[%-_])(%d+)$")
+            if not pre or (prefix and (pre ~= prefix or tonumber(n) - i ~= offset)) then
+                prefix = nil
+                break
+            end
+            prefix, offset = pre, tonumber(n) - i
+        end
+        if not prefix then return nil end
+        for i, ch in ipairs(list) do
+            ch.alt_url = ch.url
+            ch.url = (known[i] and known[i].title == ch.title) and known[i].url
+                or Site.absolute(prefix .. (i + offset))
+        end
+        return list
+    end
+    return nil
 end
 
 --- Candidate numeric ids of the novel: from the slug, then from the page.
@@ -384,11 +455,15 @@ local function fetchChapterApi(novel, html, path)
     local opts = function()
         return { referer = novel.url, retries = 0, headers = { ["X-Requested-With"] = "XMLHttpRequest" } }
     end
+    local known = novel.chapters
+    local function try(body)
+        if not body then return false end
+        local list = Site.reconcileChapters(Site.parseChapterApi(body, path), known, path)
+        return useLonger(novel, list)
+    end
     for _, aid in ipairs(novelIds(html, path)) do
-        local body = Http.post(api, "aid=" .. aid, opts())
-        if body and useLonger(novel, Site.parseChapterApi(body, path)) then return true end
-        body = Http.request(api .. "?aid=" .. aid, opts())
-        if body and useLonger(novel, Site.parseChapterApi(body, path)) then return true end
+        if try(Http.post(api, "aid=" .. aid, opts())) then return true end
+        if try(Http.request(api .. "?aid=" .. aid, opts())) then return true end
     end
     return false
 end
@@ -593,6 +668,14 @@ end
 --- Downloads a chapter. Returns the list of paragraphs or nil, err.
 function Site.fetchChapter(chapter, referer)
     local html, err = fetch(chapter.url, { referer = referer })
+    if not html and chapter.alt_url and chapter.alt_url ~= chapter.url then
+        -- the address was corrected earlier; fall back to the original one
+        local alt_html = fetch(chapter.alt_url, { referer = referer, retries = 0 })
+        if alt_html then
+            html = alt_html
+            chapter.url, chapter.alt_url = chapter.alt_url, nil
+        end
+    end
     if not html then return nil, err end
     local title = chapter.title
     if chapter.title_guess then

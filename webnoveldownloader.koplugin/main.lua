@@ -624,6 +624,9 @@ function WebNovelDownloader:download(novel, first, last, path)
         else
             logger.warn("WebNovelDownloader: chapter failed", chapter.url, fetch_err)
             failed[#failed + 1] = chapter.title
+            if not failed.error then
+                failed.error, failed.url = tostring(fetch_err), chapter.url
+            end
             added, add_err = epub:addChapter(chapter.title, {
                 T(_("This chapter could not be downloaded (%1)."), tostring(fetch_err)),
                 chapter.url,
@@ -660,8 +663,8 @@ function WebNovelDownloader:download(novel, first, last, path)
     if saved == #failed then
         epub:abort()
         Trapper:reset()
-        self:notify(T(_("Download failed: no chapter could be downloaded.\n%1"),
-                      failed[1] and _("Check your connection, or the site may be blocking requests.") or ""))
+        self:notify(T(_("Download failed: no chapter could be downloaded.\n\nError: %1\nAddress: %2\n\nIf the error is a timeout or 403/503, check your connection or wait a while (the site may be blocking requests). A 404 means the chapter address is wrong."),
+                      failed.error or _("unknown"), failed.url or ""))
         return
     end
 
@@ -687,8 +690,8 @@ function WebNovelDownloader:download(novel, first, last, path)
 
     local text = T(_("Saved %1 chapter(s) to:\n%2"), saved, path)
     if #failed > 0 then
-        text = text .. "\n\n" .. T(_("%1 chapter(s) could not be downloaded and contain a placeholder, e.g.:\n%2"),
-                                   #failed, failed[1])
+        text = text .. "\n\n" .. T(_("%1 chapter(s) could not be downloaded and contain a placeholder, e.g.:\n%2\n(%3)"),
+                                   #failed, failed[1], failed.error or "")
     end
     UIManager:show(ConfirmBox:new{
         text = text .. "\n\n" .. _("Open it now?"),

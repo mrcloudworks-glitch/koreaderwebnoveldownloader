@@ -94,6 +94,37 @@ eq(#esc.chapters, 4, "chapters via escaped api")
 eq(esc.chapters[4].title, "Chapter 4: D — x", "escaped api title")
 eq(esc.chapters[4].url, novel_url .. "/chapter-4", "escaped api url")
 
+-- API giving addresses that differ from the working ones on the novel page
+local function api_with(fmt)
+    local t = { "<select>" }
+    for n = 1, 6 do t[#t + 1] = string.format('<option value="' .. fmt .. '">Chapter %d: %s</option>', n, n, ({ "A", "B", "C", "D", "E", "F" })[n]) end
+    return table.concat(t) .. "</select>"
+end
+local saved_api = responses["https://libread.com/api/chapterlist.php"]
+for _, fmt in ipairs({ "chapter-%d", "/chapter-%d", "/lib/other-name/chapter-%d", "https://libread.com/x/chapter-%d.html" }) do
+    responses["https://libread.com/api/chapterlist.php"] = api_with(fmt)
+    local fixed = assert(Site.fetchNovel(novel_url))
+    eq(#fixed.chapters, 6, "api list kept for " .. fmt)
+    eq(fixed.chapters[1].url, novel_url .. "/chapter-1", "known address for " .. fmt)
+    eq(fixed.chapters[6].url, novel_url .. "/chapter-6", "corrected address for " .. fmt)
+end
+-- values that are not addresses at all (ids): titles line up, numbering is extended
+responses["https://libread.com/api/chapterlist.php"] = api_with("90%d7")
+local by_title = assert(Site.fetchNovel(novel_url))
+eq(#by_title.chapters, 6, "api list matched by title")
+eq(by_title.chapters[5].url, novel_url .. "/chapter-5", "address from numbering")
+eq(by_title.chapters[5].title, "Chapter 5: E", "title from api")
+-- unrelated list: not trusted, the other fallbacks apply
+responses["https://libread.com/api/chapterlist.php"] = api_with("90%d7"):gsub("Chapter", "Part")
+eq(#assert(Site.fetchNovel(novel_url)).chapters, 3, "untrusted api list rejected")
+-- corrected address fails but the original works
+local c = { title = "T", url = novel_url .. "/nope", alt_url = novel_url .. "/chapter-1" }
+responses[novel_url .. "/chapter-1"] = '<body><div id="article"><p>' .. string.rep("word ", 30) .. "</p></div></body>"
+assert(Site.fetchChapter(c, novel_url), "alt address used")
+eq(c.url, novel_url .. "/chapter-1", "alt address remembered")
+responses[novel_url .. "/chapter-1"] = nil
+responses["https://libread.com/api/chapterlist.php"] = saved_api
+
 -- API only reachable with GET
 responses["https://libread.com/api/chapterlist.php?aid=101"] = responses["https://libread.com/api/chapterlist.php"]
 responses["https://libread.com/api/chapterlist.php"] = nil
@@ -279,6 +310,8 @@ responses[novel_url .. "/chapter-1"] = nil
 menu.item_table[1].callback()
 eq(size(target), nil, "failed download leaves no file")
 eq(size(target .. ".part"), nil, "failed download leaves no temp file")
+local msg = shown[#shown].text
+assert(msg:find("HTTP 404", 1, true) and msg:find(novel_url .. "/chapter-1", 1, true), "error shows cause and address: " .. msg)
 
 -- every plugin file must at least compile
 for _, f in ipairs({ "main", "_meta", "httpclient", "libread", "htmlutil", "epubwriter" }) do
