@@ -25,6 +25,9 @@ local function once(url, opts)
         -- no Accept-Encoding: LuaSocket does not decompress gzip for us
     }
     if opts.referer then headers["Referer"] = opts.referer end
+    if opts.headers then
+        for k, v in pairs(opts.headers) do headers[k] = v end
+    end
     local request = {
         url = url,
         method = opts.method or "GET",

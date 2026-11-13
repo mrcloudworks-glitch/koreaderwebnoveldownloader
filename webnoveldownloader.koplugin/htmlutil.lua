@@ -165,6 +165,16 @@ function H.paragraphs(html)
     return out
 end
 
+--- Undoes JSON/JavaScript string escaping (\" \/ \n \uXXXX) in markup that
+-- was delivered inside a JSON value or a document.write() call.
+function H.unescapeJs(s)
+    if not s or not s:find("\\", 1, true) then return s end
+    s = s:gsub("\\u(%x%x%x%x)", function(hex) return H.utf8char(tonumber(hex, 16)) end)
+    s = s:gsub("\\([\"'/])", "%1")
+    s = s:gsub("\\[nrt]", " ")
+    return s
+end
+
 --- Percent-encodes a string for URLs / form bodies.
 function H.urlencode(s)
     return (tostring(s):gsub("[^%w%-_%.~]", function(c)

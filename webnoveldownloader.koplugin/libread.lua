@@ -342,26 +342,182 @@ function Site.parseNovel(html, url)
     return novel
 end
 
+local function useLonger(novel, list)
+    if list and #list > #novel.chapters then
+        novel.chapters = list
+        return true
+    end
+    return false
+end
+
+--- Parses a chapter-list API response (options and/or links, possibly
+-- JSON-escaped).
+function Site.parseChapterApi(body, novel_path)
+    body = H.unescapeJs(body)
+    local list = Site.parseChapterOptions(body)
+    local links = Site.parseChapterLinks(body, novel_path)
+    if #links > #list then list = links end
+    return list
+end
+
+--- Candidate numeric ids of the novel: from the slug, then from the page.
+local function novelIds(html, path)
+    local ids, seen = {}, {}
+    local function add(id)
+        if id and not seen[id] then
+            seen[id] = true
+            ids[#ids + 1] = id
+        end
+    end
+    add(novelKey(path):match("(%d+)$"))
+    add(html:match("chapterlist%.php%?aid=(%d+)"))
+    add(html:match("[%s\"'{,]aid[\"']?%s*[:=]%s*[\"']?(%d+)"))
+    add(html:match("data%-aid%s*=%s*[\"']?(%d+)"))
+    add(html:match("[%s\"'{,]bookid[\"']?%s*[:=]%s*[\"']?(%d+)"))
+    add(html:match("[%s\"'{,]novelid[\"']?%s*[:=]%s*[\"']?(%d+)"))
+    return ids
+end
+
+--- Asks the site's chapter-list API for the complete list.
+local function fetchChapterApi(novel, html, path)
+    local api = Site.base_url .. "/api/chapterlist.php"
+    local opts = function()
+        return { referer = novel.url, retries = 0, headers = { ["X-Requested-With"] = "XMLHttpRequest" } }
+    end
+    for _, aid in ipairs(novelIds(html, path)) do
+        local body = Http.post(api, "aid=" .. aid, opts())
+        if body and useLonger(novel, Site.parseChapterApi(body, path)) then return true end
+        body = Http.request(api .. "?aid=" .. aid, opts())
+        if body and useLonger(novel, Site.parseChapterApi(body, path)) then return true end
+    end
+    return false
+end
+
+--- Finds further pages of a paginated chapter index (…/2, …/2.html, ?page=2).
+function Site.parseIndexPages(html, novel_path)
+    local base = novelKey(novel_path)
+    local pages, seen = {}, {}
+    local function consider(value)
+        local path = value and Site.path(value)
+        if not path or path:sub(1, #base) ~= base then return end
+        local rest = path:sub(#base + 1)
+        local n = rest:match("^/(%d+)/?$") or rest:match("^/(%d+)%.html?$")
+            or rest:match("^/page[/-](%d+)/?$") or rest:match("^[_-](%d+)%.html?$")
+        if not n and rest:gsub("%.html?$", ""):gsub("/$", "") == "" then
+            n = value:match("[?&]page=(%d+)")
+        end
+        n = tonumber(n)
+        if n and n > 1 and n < 2000 and not seen[n] then
+            seen[n] = true
+            pages[#pages + 1] = { n = n, url = Site.absolute(value) }
+        end
+    end
+    for attrs in html:gmatch("<option([^>]*)>") do consider(H.attr(attrs, "value")) end
+    for attrs in H.anchors(html) do consider(H.attr(attrs, "href")) end
+    table.sort(pages, function(x, y) return x.n < y.n end)
+    return pages
+end
+
+--- Removes index-page links that were mistaken for chapters.
+local function dropIndexPages(chapters, pages)
+    if #pages == 0 then return chapters end
+    local is_page = {}
+    for _, pg in ipairs(pages) do is_page[novelKey(Site.path(pg.url) or "")] = true end
+    local out = {}
+    for _, ch in ipairs(chapters) do
+        if not is_page[novelKey(Site.path(ch.url) or "")] then out[#out + 1] = ch end
+    end
+    return out
+end
+
+--- Walks a paginated chapter index and merges all pages.
+local function fetchIndexPages(novel, html, path)
+    local pages = Site.parseIndexPages(html, path)
+    if #pages == 0 then return false end
+    -- Only the first/last page may be linked: fill the gaps (same URL scheme).
+    local last = pages[#pages]
+    local have = {}
+    for _, pg in ipairs(pages) do have[pg.n] = pg end
+    local template = last.url
+    local all, seen = {}, {}
+    for _, ch in ipairs(dropIndexPages(novel.chapters, pages)) do
+        seen[ch.url] = true
+        all[#all + 1] = ch
+    end
+    for n = 2, last.n do
+        local pg = have[n]
+        local page_url = pg and pg.url
+        if not page_url then
+            local count
+            page_url, count = template:gsub(tostring(last.n) .. "(%.?h?t?m?l?/?)$", tostring(n) .. "%1")
+            if count == 0 then page_url = nil end
+        end
+        local page_html = page_url and Http.request(page_url, { referer = novel.url, retries = 1 })
+        if page_html then
+            local block = H.findElement(page_html, "ul", function(a) return H.attr(a, "id") == "idData" end)
+            local list = dropIndexPages(Site.parseChapterLinks(block or page_html, path), pages)
+            for _, ch in ipairs(list) do
+                if not seen[ch.url] then
+                    seen[ch.url] = true
+                    all[#all + 1] = ch
+                end
+            end
+        end
+    end
+    return useLonger(novel, sortByNumber(all))
+end
+
+--- Last resort: the page links to the newest chapter (say chapter-1500) but
+-- lists fewer. When chapter addresses are plainly numbered, fill in the
+-- missing ones; their real titles are read from the chapter pages later.
+function Site.fillNumberedChapters(novel, html, path)
+    local base = novelKey(path) .. "/"
+    local prefix, numbered = nil, {}
+    for _, ch in ipairs(novel.chapters) do
+        local p = Site.path(ch.url) or ""
+        local pre, n = p:match("^(.-chapter[%-_])(%d+)$")
+        if not pre or (prefix and pre ~= prefix) then return false end
+        prefix = pre
+        numbered[tonumber(n)] = ch
+    end
+    if not prefix or prefix:sub(1, #base) ~= base then return false end
+    local max = 0
+    for n in pairs(numbered) do if n > max then max = n end end
+    local plain = prefix:gsub("%p", "%%%0")
+    for attrs in H.anchors(html) do
+        local p = Site.path(H.attr(attrs, "href") or "")
+        local n = p and tonumber(p:match("^" .. plain .. "(%d+)$"))
+        if n and n > max then max = n end
+    end
+    if max <= #novel.chapters or max > 20000 then return false end
+    local first = numbered[0] and 0 or 1
+    local list = {}
+    for n = first, max do
+        list[#list + 1] = numbered[n] or {
+            title = "Chapter " .. n,
+            url = Site.absolute(prefix .. n),
+            title_guess = true,
+        }
+    end
+    novel.chapters = list
+    novel.chapters_guessed = true
+    return true
+end
+
 --- Loads a novel page and its complete chapter list.
 function Site.fetchNovel(url)
     url = Site.absolute(url)
     local html, err = fetch(url)
     if not html then return nil, err end
     local novel = Site.parseNovel(html, url)
+    local path = Site.path(url) or "/"
 
-    -- The full chapter list is served by a small API keyed by the numeric id
-    -- at the end of the novel slug; use it when it knows more chapters.
-    local aid = novelKey(Site.path(url) or ""):match("(%d+)$")
-    if aid then
-        local api_html = Http.post(Site.base_url .. "/api/chapterlist.php", "aid=" .. aid,
-                                   { referer = url, retries = 0 })
-        if api_html then
-            local list = Site.parseChapterOptions(api_html)
-            if #list > #novel.chapters then
-                novel.chapters = list
-            end
-        end
-    end
+    -- The novel page only embeds the first chapters (40 at the time of
+    -- writing). Try, in order: the site's chapter-list API, the paginated
+    -- chapter index, and finally numbering up to the newest linked chapter.
+    local ok = fetchChapterApi(novel, html, path)
+    if not ok then ok = fetchIndexPages(novel, html, path) end
+    if not ok then Site.fillNumberedChapters(novel, html, path) end
 
     if #novel.chapters == 0 then
         return nil, "no chapters found on this page"
@@ -385,6 +541,25 @@ local content_matchers = {
 
 local function normalize(s)
     return (s:lower():gsub("[^%w]", ""))
+end
+
+--- Reads the chapter title shown on a chapter page (or nil).
+function Site.parseChapterTitle(html)
+    local span = html:match("<span[^>]*class%s*=%s*[\"'][^\"']*chapter[^\"']*[\"'][^>]*>(.-)</span>")
+    local title = span and H.text(span) or ""
+    if title == "" then
+        for _, tag in ipairs({ "h1", "h2", "h3", "h4" }) do
+            for inner in html:gmatch("<" .. tag .. "[^>]*>(.-)</" .. tag .. ">") do
+                local t = H.text(inner)
+                if t:lower():find("chapter", 1, true) and #t < 200 then
+                    title = t
+                    break
+                end
+            end
+            if title ~= "" then break end
+        end
+    end
+    if title ~= "" then return title end
 end
 
 --- Extracts the chapter text as a list of paragraphs.
@@ -419,7 +594,14 @@ end
 function Site.fetchChapter(chapter, referer)
     local html, err = fetch(chapter.url, { referer = referer })
     if not html then return nil, err end
-    return Site.parseChapter(html, chapter.title)
+    local title = chapter.title
+    if chapter.title_guess then
+        title = Site.parseChapterTitle(html) or title
+    end
+    local paragraphs
+    paragraphs, err = Site.parseChapter(html, title)
+    if not paragraphs then return nil, err end
+    return paragraphs, nil, title
 end
 
 --- Downloads the cover image bytes (or nil).

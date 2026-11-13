@@ -373,6 +373,9 @@ function WebNovelDownloader:showNovelInfo(novel)
     local lines = { novel.title }
     if novel.author ~= "" then lines[#lines + 1] = T(_("Author: %1"), novel.author) end
     lines[#lines + 1] = T(_("Chapters: %1"), #novel.chapters)
+    if novel.chapters_guessed then
+        lines[#lines + 1] = _("The site did not provide the full chapter list, so chapters were numbered up to the newest one. Their titles are read while downloading.")
+    end
     lines[#lines + 1] = novel.url
     if novel.description ~= "" then
         lines[#lines + 1] = ""
@@ -606,9 +609,14 @@ function WebNovelDownloader:download(novel, first, last, path)
             Trapper:info(T(_("Downloading chapter %1 of %2\n%3"), done + 1, count, chapter.title))
         end
 
-        local ok, paragraphs, fetch_err = pcall(Site.fetchChapter, chapter, novel.url)
+        local ok, paragraphs, fetch_err, page_title = pcall(Site.fetchChapter, chapter, novel.url)
         if not ok then
             fetch_err, paragraphs = tostring(paragraphs), nil
+        end
+        if paragraphs and page_title and chapter.title_guess then
+            -- remember the real title read from the chapter page
+            chapter.title = page_title
+            chapter.title_guess = nil
         end
         local added, add_err
         if paragraphs then

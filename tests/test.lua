@@ -83,9 +83,65 @@ eq(#novel.chapters, 3, "chapters via api")
 eq(novel.chapters[3].url, novel_url .. "/chapter-3", "chapter url")
 eq(requests[#requests].opts.body, "aid=101", "api body")
 
+-- API answering with JSON-escaped markup (quotes and slashes backslashed)
+responses["https://libread.com/api/chapterlist.php"] = [[{"html":"<select>
+<option value=\"\/libread\/first-novel-101\/chapter-1\">Chapter 1: A<\/option>
+<option value=\"\/libread\/first-novel-101\/chapter-2\">Chapter 2: B<\/option>
+<option value=\"\/libread\/first-novel-101\/chapter-3\">Chapter 3: C<\/option>
+<option value=\"\/libread\/first-novel-101\/chapter-4\">Chapter 4: D \u2014 x<\/option><\/select>"}]]
+local esc = assert(Site.fetchNovel(novel_url))
+eq(#esc.chapters, 4, "chapters via escaped api")
+eq(esc.chapters[4].title, "Chapter 4: D — x", "escaped api title")
+eq(esc.chapters[4].url, novel_url .. "/chapter-4", "escaped api url")
+
+-- API only reachable with GET
+responses["https://libread.com/api/chapterlist.php?aid=101"] = responses["https://libread.com/api/chapterlist.php"]
+responses["https://libread.com/api/chapterlist.php"] = nil
+eq(#assert(Site.fetchNovel(novel_url)).chapters, 4, "chapters via GET api")
+responses["https://libread.com/api/chapterlist.php?aid=101"] = nil
+
+-- no API: paginated chapter index (only pages 2 and 3 exist; page 3 is not linked from page 1... but the last is)
+local function index_page(from, to, extra)
+    local t = { pad, "<h1 class='tit'>Paged</h1>", extra or "", '<ul id="idData">' }
+    for n = from, to do
+        t[#t + 1] = string.format('<li><a href="/libread/paged-55/chapter-%d">Chapter %d</a></li>', n, n)
+    end
+    t[#t + 1] = "</ul>"
+    return table.concat(t)
+end
+local paged_url = "https://libread.com/libread/paged-55"
+local pager = '<select><option value="/libread/paged-55">1 - 40</option><option value="/libread/paged-55/3">81 - 95</option></select>'
+responses[paged_url] = index_page(1, 40, pager)
+responses[paged_url .. "/2"] = index_page(41, 80, pager)
+responses[paged_url .. "/3"] = index_page(81, 95, pager)
+local paged = assert(Site.fetchNovel(paged_url))
+eq(#paged.chapters, 95, "chapters via paginated index")
+eq(paged.chapters[95].url, paged_url .. "/chapter-95", "paginated last chapter")
+eq(paged.chapters_guessed, nil, "paginated list is not guessed")
+
+-- no API, no index pages: number up to the newest chapter linked on the page
+local num_url = "https://libread.com/libread/numbered-77"
+responses[num_url] = index_page(1, 40, '<a href="/libread/numbered-77/chapter-120">Chapter 120: Newest</a>')
+    :gsub("paged%-55", "numbered-77")
+local numbered = assert(Site.fetchNovel(num_url))
+eq(#numbered.chapters, 120, "chapters via numbering")
+eq(numbered.chapters[40].title_guess, nil, "known chapter keeps its title")
+eq(numbered.chapters[41].title_guess, true, "filled chapter is marked")
+eq(numbered.chapters[120].url, num_url .. "/chapter-120", "numbered url")
+eq(numbered.chapters_guessed, true, "numbered flag")
+responses[num_url .. "/chapter-41"] = [[<body><span class="chapter">Chapter 41: The Real Title</span>
+<div id="article"><p>Chapter 41: The Real Title</p><p>Some text that is long enough to be accepted as the body of a chapter, surely.</p><p>More.</p></div></body>]]
+local np, nerr, ntitle = Site.fetchChapter(numbered.chapters[41], num_url)
+eq(nerr, nil, "numbered chapter error")
+eq(ntitle, "Chapter 41: The Real Title", "title read from chapter page")
+eq(#np, 2, "duplicate title line dropped")
+
 -- without the API: page list (idData), then whole-page fallback sorted by number
 responses["https://libread.com/api/chapterlist.php"] = nil
-eq(#assert(Site.fetchNovel(novel_url)).chapters, 2, "chapters via idData")
+local filled = assert(Site.fetchNovel(novel_url))
+eq(#filled.chapters, 3, "idData list filled up to the newest linked chapter")
+eq(filled.chapters[3].title_guess, true, "filled chapter marked")
+eq(#Site.parseNovel(responses[novel_url], novel_url).chapters, 2, "chapters via idData")
 local p = Site.parseNovel([[<h1>T</h1><a href="/libread/t-7/chapter-10">Ch 10</a>
 <a href="/libread/t-7/chapter-2">Ch 2</a><a href="/libread/t-7/chapter-10">Ch 10</a><a href="/libread/t-70/chapter-1">other</a>]],
     "https://libread.com/libread/t-7")
@@ -181,7 +237,7 @@ responses[novel_url .. "/chapter-1"] = chapter_html
 plugin:openNovel(novel_url)
 local menu = shown[#shown]
 eq(menu.kind, "menu", "novel screen")
-eq(#menu.item_table, 3 + 2, "novel screen rows")
+eq(#menu.item_table, 3 + 3, "novel screen rows")
 
 local target = "tests/First Novel.epub"
 os.remove(target)

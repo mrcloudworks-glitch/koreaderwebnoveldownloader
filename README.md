@@ -57,6 +57,10 @@ python3 tests/run_tests.py
 
 ## Notes
 
+- The novel page itself only lists the first 40 chapters. The plugin gets the
+  full list from the site's chapter-list API, then from the paginated chapter
+  index, and as a last resort numbers the chapters up to the newest one linked
+  on the page (titles are then read from each chapter while downloading).
 - The site's markup can change. If a list or chapter comes up empty, the
   selectors in `libread.lua` are the place to adjust.
 - Download only what you are allowed to, for personal reading, and keep the
