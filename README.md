@@ -61,6 +61,11 @@ python3 tests/run_tests.py
   full list from the site's chapter-list API, then from the paginated chapter
   index, and as a last resort numbers the chapters up to the newest one linked
   on the page (titles are then read from each chapter while downloading).
+- If the site answers "403 Forbidden", it is refusing requests from your
+  device, usually after too many requests in a short time. The plugin waits
+  once, retries once, then stops and offers to save what it has. It does not
+  try to get around the block: wait a while, then continue from the chapter
+  where it stopped. A pause of 1500 ms or more between chapters helps.
 - The site's markup can change. If a list or chapter comes up empty, the
   selectors in `libread.lua` are the place to adjust.
 - Download only what you are allowed to, for personal reading, and keep the

@@ -7,6 +7,7 @@ package.loaded["httpclient"] = {
     request = function(url, opts)
         requests[#requests + 1] = { url = url, opts = opts or {} }
         local r = responses[url]
+        if type(r) == "table" then return nil, r.err end
         if r then return r end
         return nil, "HTTP 404"
     end,
@@ -203,6 +204,7 @@ assert(epub:finish())
 
 -- main.lua smoke test with stubbed KOReader modules -----------------------------
 local shown = {}
+slept = 0
 local function widget(kind)
     local W = { kind = kind }
     W.new = function(class, o) return setmetatable(o, { __index = class }) end
@@ -228,7 +230,7 @@ package.loaded["ffi/util"] = {
         local args = { ... }
         return (str:gsub("%%(%d)", function(i) return tostring(args[tonumber(i)]) end))
     end,
-    usleep = function() end,
+    usleep = function(us) slept = slept + us / 1000000 end,
 }
 package.loaded["libs/libkoreader-lfs"] = {
     attributes = function(path)
@@ -318,3 +320,51 @@ for _, f in ipairs({ "main", "_meta", "httpclient", "libread", "htmlutil", "epub
     assert(loadfile("webnoveldownloader.koplugin/" .. f .. ".lua"))
 end
 print("lua: all tests passed")
+
+-- site refusing requests (403): wait once, retry once, then stop -----------------
+local blocked_url = "https://libread.com/libread/blocked-9"
+local rows = {}
+for n = 1, 5 do rows[#rows + 1] = string.format('<a href="/libread/blocked-9/chapter-%d">Chapter %d</a>', n, n) end
+responses[blocked_url] = pad .. "<h1 class='tit'>Blocked</h1><ul id='idData'>" .. table.concat(rows) .. "</ul>"
+responses[blocked_url .. "/chapter-1"] = chapter_html
+responses[blocked_url .. "/chapter-2"] = chapter_html
+local refused = { err = "HTTP 403 Forbidden (blocked by the site's anti-bot protection)" }
+for n = 3, 5 do responses[blocked_url .. "/chapter-" .. n] = refused end
+plugin.settings.overwrite_mode = "overwrite"
+eq(plugin.settings.delay_ms, 1500, "gentler default pause")
+
+local before = #requests
+plugin:openNovel(blocked_url)
+local bmenu = shown[#shown]
+eq(#bmenu.item_table, 3 + 5, "blocked novel rows")
+local opened = #requests
+plugin:openNovel(blocked_url)
+eq(#requests, opened, "novel list is cached within a session")
+
+before, slept = #requests, 0
+bmenu.item_table[1].callback()
+local chapter_requests = 0
+for i = before + 1, #requests do
+    if requests[i].url:find("/chapter-", 1, true) then chapter_requests = chapter_requests + 1 end
+end
+eq(chapter_requests, 4, "stops after one retry instead of requesting every chapter")
+assert(slept >= 30, "waited before the retry")
+local btarget = "tests/Blocked.epub"
+assert(size(btarget), "chapters downloaded before the block are saved")
+os.remove(btarget)
+
+-- refused from the very first chapter: nothing saved, clear message
+for n = 1, 2 do responses[blocked_url .. "/chapter-" .. n] = refused end
+before = #requests
+bmenu.item_table[1].callback()
+eq(#requests - before, 2, "two requests only when refused at once")
+eq(size(btarget), nil, "no file when refused at once")
+local bmsg = shown[#shown].text
+assert(bmsg:find("HTTP 403", 1, true) and bmsg:find("wait a while", 1, true), "blocked message: " .. bmsg)
+
+-- refused while loading the chapter list: no further list requests
+responses["https://libread.com/api/chapterlist.php"] = refused
+before = #requests
+assert(Site.fetchNovel(blocked_url))
+eq(#requests - before, 2, "list loading stops when refused")
+print("lua: blocked-site tests passed")

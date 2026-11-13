@@ -79,6 +79,20 @@ local function isNovelPath(path)
     return first == "libread" or first == "novel" or first == "book" or slug:find("%-%d+$") ~= nil
 end
 
+--- Seconds to wait between consecutive requests made while loading lists.
+Site.request_pause = 1
+
+function Site.pause()
+    if Site.request_pause > 0 and Site.sleep then Site.sleep(Site.request_pause) end
+end
+
+--- True if the error means the site is refusing or throttling requests.
+function Site.isBlocked(err)
+    if Http.isBlocked then return Http.isBlocked(err) end
+    err = tostring(err or "")
+    return err:find("^HTTP 403") ~= nil or err:find("^HTTP 429") ~= nil or err:find("^HTTP 503") ~= nil
+end
+
 local function fetch(url, opts)
     local body, err = Http.request(url, opts)
     if not body then return nil, err end
@@ -461,9 +475,18 @@ local function fetchChapterApi(novel, html, path)
         local list = Site.reconcileChapters(Site.parseChapterApi(body, path), known, path)
         return useLonger(novel, list)
     end
-    for _, aid in ipairs(novelIds(html, path)) do
-        if try(Http.post(api, "aid=" .. aid, opts())) then return true end
-        if try(Http.request(api .. "?aid=" .. aid, opts())) then return true end
+    -- Keep this light: at most two ids, and stop at once if the site refuses.
+    local ids = novelIds(html, path)
+    for i = 1, math.min(2, #ids) do
+        local aid = ids[i]
+        local body, err = Http.post(api, "aid=" .. aid, opts())
+        if try(body) then return true end
+        if Site.isBlocked(err) then return false, err end
+        Site.pause()
+        body, err = Http.request(api .. "?aid=" .. aid, opts())
+        if try(body) then return true end
+        if Site.isBlocked(err) then return false, err end
+        Site.pause()
     end
     return false
 end
@@ -527,7 +550,12 @@ local function fetchIndexPages(novel, html, path)
             page_url, count = template:gsub(tostring(last.n) .. "(%.?h?t?m?l?/?)$", tostring(n) .. "%1")
             if count == 0 then page_url = nil end
         end
-        local page_html = page_url and Http.request(page_url, { referer = novel.url, retries = 1 })
+        local page_html, page_err
+        if page_url then
+            Site.pause()
+            page_html, page_err = Http.request(page_url, { referer = novel.url, retries = 0 })
+        end
+        if Site.isBlocked(page_err) then break end
         if page_html then
             local block = H.findElement(page_html, "ul", function(a) return H.attr(a, "id") == "idData" end)
             local list = dropIndexPages(Site.parseChapterLinks(block or page_html, path), pages)
@@ -590,8 +618,8 @@ function Site.fetchNovel(url)
     -- The novel page only embeds the first chapters (40 at the time of
     -- writing). Try, in order: the site's chapter-list API, the paginated
     -- chapter index, and finally numbering up to the newest linked chapter.
-    local ok = fetchChapterApi(novel, html, path)
-    if not ok then ok = fetchIndexPages(novel, html, path) end
+    local ok, blocked = fetchChapterApi(novel, html, path)
+    if not ok and not blocked then ok = fetchIndexPages(novel, html, path) end
     if not ok then Site.fillNumberedChapters(novel, html, path) end
 
     if #novel.chapters == 0 then

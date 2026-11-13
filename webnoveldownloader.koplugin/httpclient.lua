@@ -76,9 +76,20 @@ function Http.request(url, opts)
         logger.warn("WebNovelDownloader: request failed", url, err, "attempt", attempt)
         -- client errors won't get better by retrying
         if code and code >= 400 and code < 500 and code ~= 429 then break end
-        if attempt < attempts then socket.sleep(1.5 * attempt) end
+        if attempt < attempts then
+            -- "too many requests": give the server a real break
+            socket.sleep(code == 429 and 10 * attempt or 1.5 * attempt)
+        end
     end
     return nil, err
+end
+
+--- True if an error message means the site is refusing or throttling us
+-- (as opposed to a missing page or a network problem).
+function Http.isBlocked(err)
+    err = tostring(err or "")
+    return err:find("^HTTP 403") ~= nil or err:find("^HTTP 429") ~= nil
+        or err:find("^HTTP 503") ~= nil or err:find("anti%-bot") ~= nil
 end
 
 function Http.get(url, opts)

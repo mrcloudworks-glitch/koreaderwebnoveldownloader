@@ -40,7 +40,14 @@ function WebNovelDownloader:init()
     self.settings = G_reader_settings:readSetting(SETTINGS_KEY) or {}
     if self.settings.overwrite_mode == nil then self.settings.overwrite_mode = "ask" end
     if self.settings.include_cover == nil then self.settings.include_cover = true end
-    if self.settings.delay_ms == nil then self.settings.delay_ms = 500 end
+    -- Older versions defaulted to 500 ms, which the site tends to answer with
+    -- "403 Forbidden"; move those installs to the gentler default once.
+    if self.settings.delay_ms == nil or (self.settings.delay_ms < 1500 and not self.settings.delay_migrated) then
+        self.settings.delay_ms = 1500
+    end
+    self.settings.delay_migrated = true
+    self.novel_cache = {}
+    Site.sleep = function(seconds) ffiUtil.usleep(seconds * 1000000) end
     self.menus = {}
     self.ui.menu:registerToMainMenu(self)
 end
@@ -131,11 +138,11 @@ function WebNovelDownloader:addToMainMenu(menu_items)
                         info_text = _("A short pause is kinder to the website and avoids being blocked."),
                         value = self.settings.delay_ms,
                         value_min = 0,
-                        value_max = 5000,
+                        value_max = 10000,
                         value_step = 100,
                         value_hold_step = 500,
                         unit = "ms",
-                        default_value = 500,
+                        default_value = 1500,
                         callback = function(spin)
                             self.settings.delay_ms = spin.value
                             self:saveSettings()
@@ -333,12 +340,23 @@ end
 
 -- Novel screen ---------------------------------------------------------------
 
+function WebNovelDownloader:blockedAdvice()
+    return _("The website is refusing requests from this device for now. This usually passes by itself: wait a while (from several minutes to a few hours) before trying again, and keep the pause between chapters at 1500 ms or more.")
+end
+
 function WebNovelDownloader:openNovel(url)
-    local novel, err = self:withLoading(_("Loading novel…"), function()
-        return Site.fetchNovel(url)
-    end)
+    -- Reuse the list loaded earlier in this session: fewer requests to the site.
+    local novel, err = self.novel_cache[url], nil
     if not novel then
-        self:notify(T(_("Could not load the novel:\n%1"), err or _("unknown error")))
+        novel, err = self:withLoading(_("Loading novel…"), function()
+            return Site.fetchNovel(url)
+        end)
+        if novel then self.novel_cache[url] = novel end
+    end
+    if not novel then
+        local text = T(_("Could not load the novel:\n%1"), err or _("unknown error"))
+        if Site.isBlocked(err) then text = text .. "\n\n" .. self:blockedAdvice() end
+        self:notify(text)
         return
     end
     local total = #novel.chapters
@@ -476,6 +494,9 @@ end
 
 -- Downloading ----------------------------------------------------------------
 
+-- Seconds to wait before the single retry after the site refuses a request.
+local BLOCK_WAIT = 30
+
 local function safeFilename(name)
     name = name:gsub('[/\\:%*%?"<>|%c]', " "):gsub("%s+", " ")
     name = name:gsub("^[%s%.]+", ""):gsub("[%s%.]+$", "")
@@ -594,6 +615,7 @@ function WebNovelDownloader:download(novel, first, last, path)
     end
 
     local failed = {}
+    local blocked
     local cancelled = false
     local write_error
     for i = first, last do
@@ -612,6 +634,21 @@ function WebNovelDownloader:download(novel, first, last, path)
         local ok, paragraphs, fetch_err, page_title = pcall(Site.fetchChapter, chapter, novel.url)
         if not ok then
             fetch_err, paragraphs = tostring(paragraphs), nil
+        end
+        if not paragraphs and Site.isBlocked(fetch_err) then
+            -- The site is refusing us. Wait once and try again; if it still
+            -- refuses, stop instead of sending more requests it will reject.
+            Trapper:info(T(_("The website refused the request (%1).\nWaiting %2 seconds before one more try…"),
+                           tostring(fetch_err), BLOCK_WAIT))
+            ffiUtil.usleep(BLOCK_WAIT * 1000000)
+            ok, paragraphs, fetch_err, page_title = pcall(Site.fetchChapter, chapter, novel.url)
+            if not ok then
+                fetch_err, paragraphs = tostring(paragraphs), nil
+            end
+            if not paragraphs and Site.isBlocked(fetch_err) then
+                blocked = { error = tostring(fetch_err), index = i, title = chapter.title }
+                break
+            end
         end
         if paragraphs and page_title and chapter.title_guess then
             -- remember the real title read from the chapter page
@@ -650,6 +687,25 @@ function WebNovelDownloader:download(novel, first, last, path)
     end
 
     local saved = epub:chapterCount()
+    if blocked then
+        local text = T(_("Download stopped at chapter %1:\n%2\n\nError: %3\n\n%4"),
+                       blocked.index, blocked.title, blocked.error, self:blockedAdvice())
+        if saved - #failed <= 0 then
+            epub:abort()
+            Trapper:reset()
+            self:notify(text)
+            return
+        end
+        local keep = Trapper:confirm(
+            text .. "\n\n" .. T(_("Save the %1 chapter(s) downloaded so far? Later you can continue from chapter %2 (tap it in the list, then \"Download from here to the end\")."),
+                                saved, blocked.index),
+            _("Discard"), _("Save"))
+        if not keep then
+            epub:abort()
+            Trapper:reset()
+            return
+        end
+    end
     if cancelled then
         local keep = saved > 0 and Trapper:confirm(
             T(_("Download stopped.\nSave the %1 chapter(s) downloaded so far?"), saved),
